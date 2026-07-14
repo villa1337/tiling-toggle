@@ -17,5 +17,10 @@
       <summary>Outline color</summary>
       <description>Color of the focus outline border (hex format).</description>
     </key>
+    <key name="layout-mode" type="s">
+      <default>'grid'</default>
+      <summary>Layout mode</summary>
+      <description>Tiling layout algorithm: "grid" (square-root grid) or "fibonacci" (master + spiral stack).</description>
+    </key>
   </schema>
 </schemalist>

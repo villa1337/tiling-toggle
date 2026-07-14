@@ -17,8 +17,11 @@ export default class TilingToggleExtension extends Extension {
     #focusSignalId = null;
     #windowCreatedSignalId = null;
     #windowCloseSignals = new Map();
+    #windowFullscreenSignals = new Map();
     #retileLaterId = null;
     #closeIdleId = null;
+    #outlineDelayId = null;
+    #retiling = false;
 
     enable() {
         this.#settings = this.getSettings('org.gnome.shell.extensions.tiling-toggle');
@@ -50,6 +53,7 @@ export default class TilingToggleExtension extends Extension {
         return workspace.list_windows().filter(w =>
             !w.is_skip_taskbar() &&
             !w.minimized &&
+            !w.is_fullscreen() &&
             w.get_window_type() === Meta.WindowType.NORMAL
         );
     }
@@ -80,6 +84,7 @@ export default class TilingToggleExtension extends Extension {
         this.#setupOutline();
         this.#connectWindowCreated();
         this.#connectWindowCloseAll(windows);
+        this.#connectWindowFullscreenAll(windows);
         this.#retile(windows);
     }
 
@@ -104,6 +109,7 @@ export default class TilingToggleExtension extends Extension {
         this.#destroyOutline();
         this.#disconnectWindowCreated();
         this.#disconnectAllWindowClose();
+        this.#disconnectAllWindowFullscreen();
         this.#savedGeometries.clear();
         this.#tiled = false;
     }
@@ -112,30 +118,57 @@ export default class TilingToggleExtension extends Extension {
 
     #retile(windows) {
         this.#cancelPending();
+        this.#retiling = true;
 
         // Hide outline during layout transition
         if (this.#outline)
             this.#outline.hide();
 
-        this.#applyGrid(windows);
+        this.#applyLayout(windows);
 
-        // Use Meta.later_add to position outline AFTER compositor commits frame rects
-        this.#retileLaterId = Meta.later_add(Meta.LaterType.BEFORE_REDRAW, () => {
-            this.#retileLaterId = null;
-            this.#positionOutline();
+        // Two-stage defer: BEFORE_REDRAW lets Mutter commit the layout,
+        // then a second BEFORE_REDRAW on the next frame reads settled rects.
+        // After both frames, a short timeout (50ms) gives the compositor time
+        // to fully paint the settled positions before we draw the outline.
+        const laters = global.compositor.get_laters();
+        this.#retileLaterId = laters.add(Meta.LaterType.BEFORE_REDRAW, () => {
+            this.#retileLaterId = laters.add(Meta.LaterType.BEFORE_REDRAW, () => {
+                this.#retileLaterId = null;
+                // Small delay so the compositor finishes painting settled windows
+                this.#outlineDelayId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
+                    this.#outlineDelayId = null;
+                    this.#retiling = false;
+                    this.#positionOutline();
+                    return GLib.SOURCE_REMOVE;
+                });
+                return GLib.SOURCE_REMOVE;
+            });
             return GLib.SOURCE_REMOVE;
         });
     }
 
     #cancelPending() {
         if (this.#retileLaterId !== null) {
-            Meta.later_remove(this.#retileLaterId);
+            global.compositor.get_laters().remove(this.#retileLaterId);
             this.#retileLaterId = null;
+        }
+        if (this.#outlineDelayId) {
+            GLib.source_remove(this.#outlineDelayId);
+            this.#outlineDelayId = null;
         }
         if (this.#closeIdleId) {
             GLib.source_remove(this.#closeIdleId);
             this.#closeIdleId = null;
         }
+        this.#retiling = false;
+    }
+
+    #applyLayout(windows) {
+        const mode = this.#settings.get_string('layout-mode');
+        if (mode === 'fibonacci')
+            this.#applyFibonacci(windows);
+        else
+            this.#applyGrid(windows);
     }
 
     #applyGrid(windows) {
@@ -183,6 +216,42 @@ export default class TilingToggleExtension extends Extension {
         }
     }
 
+    #applyFibonacci(windows) {
+        const monitor = global.display.get_current_monitor();
+        const workspace = global.workspace_manager.get_active_workspace();
+        const workArea = workspace.get_work_area_for_monitor(monitor);
+
+        const gap = TILE_GAP;
+        let x = workArea.x + OUTER_GAP;
+        let y = workArea.y + OUTER_GAP;
+        let w = workArea.width - OUTER_GAP * 2;
+        let h = workArea.height - OUTER_GAP * 2;
+
+        const count = windows.length;
+
+        for (let i = 0; i < count; i++) {
+            if (i === count - 1) {
+                // Last window takes all remaining space
+                windows[i].move_resize_frame(false, x, y, w, h);
+            } else {
+                // Alternate splits: even = vertical (left/right), odd = horizontal (top/bottom)
+                if (i % 2 === 0) {
+                    // Split vertically — this window gets the left portion
+                    const splitW = Math.floor((w - gap) * 0.55);
+                    windows[i].move_resize_frame(false, x, y, splitW, h);
+                    x += splitW + gap;
+                    w -= splitW + gap;
+                } else {
+                    // Split horizontally — this window gets the top portion
+                    const splitH = Math.floor((h - gap) * 0.55);
+                    windows[i].move_resize_frame(false, x, y, w, splitH);
+                    y += splitH + gap;
+                    h -= splitH + gap;
+                }
+            }
+        }
+    }
+
     // --- Auto-tile new windows ---
 
     #connectWindowCreated() {
@@ -209,6 +278,7 @@ export default class TilingToggleExtension extends Extension {
                     win.unmaximize();
 
                 this.#connectWindowClose(win);
+                this.#connectWindowFullscreen(win);
                 this.#retile(this.#getWindows());
             });
         });
@@ -251,6 +321,7 @@ export default class TilingToggleExtension extends Extension {
         const closedId = closedWin.get_id();
         this.#savedGeometries.delete(closedId);
         this.#windowCloseSignals.delete(closedId);
+        this.#disconnectWindowFullscreen(closedId);
 
         if (this.#closeIdleId) {
             GLib.source_remove(this.#closeIdleId);
@@ -273,6 +344,58 @@ export default class TilingToggleExtension extends Extension {
         });
     }
 
+    // --- Fullscreen handling ---
+
+    #connectWindowFullscreen(win) {
+        const signalId = win.connect('notify::fullscreen', () => {
+            this.#onWindowFullscreenChanged(win);
+        });
+        this.#windowFullscreenSignals.set(win.get_id(), {window: win, signalId});
+    }
+
+    #connectWindowFullscreenAll(windows) {
+        for (const win of windows) {
+            this.#connectWindowFullscreen(win);
+        }
+    }
+
+    #disconnectWindowFullscreen(winId) {
+        const entry = this.#windowFullscreenSignals.get(winId);
+        if (entry) {
+            try {
+                entry.window.disconnect(entry.signalId);
+            } catch (_e) {}
+            this.#windowFullscreenSignals.delete(winId);
+        }
+    }
+
+    #disconnectAllWindowFullscreen() {
+        for (const [_id, {window, signalId}] of this.#windowFullscreenSignals) {
+            try {
+                window.disconnect(signalId);
+            } catch (_e) {}
+        }
+        this.#windowFullscreenSignals.clear();
+    }
+
+    #onWindowFullscreenChanged(win) {
+        if (!this.#tiled) return;
+
+        // Whether entering or exiting fullscreen, retile the remaining
+        // non-fullscreen windows. The outline will be hidden during retile
+        // and repositioned on the correct (non-fullscreen) focused window.
+        const remaining = this.#getWindows();
+
+        if (remaining.length === 0) {
+            // All windows are fullscreen — just hide the outline
+            if (this.#outline)
+                this.#outline.hide();
+            return;
+        }
+
+        this.#retile(remaining);
+    }
+
     // --- Focus outline ---
 
     #setupOutline() {
@@ -292,8 +415,10 @@ export default class TilingToggleExtension extends Extension {
 
         // Synchronous focus handler — no idle, no deferred positioning.
         // When focus changes, the window rects are already settled.
+        // Skip during active retile — the retile callback will position the outline.
         this.#focusSignalId = global.display.connect('notify::focus-window', () => {
-            this.#positionOutline();
+            if (!this.#retiling)
+                this.#positionOutline();
         });
     }
 
@@ -302,7 +427,7 @@ export default class TilingToggleExtension extends Extension {
 
         const focused = global.display.get_focus_window();
 
-        if (!focused || !this.#savedGeometries.has(focused.get_id())) {
+        if (!focused || !this.#savedGeometries.has(focused.get_id()) || focused.is_fullscreen()) {
             this.#outline.hide();
             return;
         }

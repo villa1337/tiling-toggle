@@ -69,6 +69,39 @@ export default class TilingTogglePreferences extends ExtensionPreferences {
         });
         row.add_controller(controller);
 
+        // --- Layout Mode ---
+        const layoutGroup = new Adw.PreferencesGroup({
+            title: 'Layout',
+            description: 'Choose how windows are arranged when tiled',
+        });
+        page.add(layoutGroup);
+
+        const layoutModel = new Gtk.StringList();
+        layoutModel.append('Grid');
+        layoutModel.append('Fibonacci');
+
+        const layoutRow = new Adw.ComboRow({
+            title: 'Layout Mode',
+            subtitle: 'Grid: square-root grid · Fibonacci: master + spiral stack',
+            model: layoutModel,
+        });
+        layoutGroup.add(layoutRow);
+
+        const layoutValues = ['grid', 'fibonacci'];
+
+        const loadLayout = () => {
+            const current = settings.get_string('layout-mode');
+            const idx = layoutValues.indexOf(current);
+            layoutRow.set_selected(idx >= 0 ? idx : 0);
+        };
+        loadLayout();
+
+        layoutRow.connect('notify::selected', () => {
+            const idx = layoutRow.get_selected();
+            if (idx >= 0 && idx < layoutValues.length)
+                settings.set_string('layout-mode', layoutValues[idx]);
+        });
+
         // --- Focus Outline ---
         const outlineGroup = new Adw.PreferencesGroup({
             title: 'Focus Outline',
