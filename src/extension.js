@@ -1,19 +1,23 @@
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
+import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
-const TILE_GAP = 6; // pixels between tiles
-const OUTER_GAP = 6; // pixels from screen edges (top, left, right, bottom)
+const OUTLINE_WIDTH = 3;
+const TILE_GAP = 6;
+const OUTER_GAP = 6;
 
 export default class TilingToggleExtension extends Extension {
     #settings = null;
     #tiled = false;
-    #savedGeometries = new Map(); // windowId -> {x, y, width, height, maximized}
+    #savedGeometries = new Map();
+    #outline = null;
+    #focusSignalId = null;
     #windowCreatedSignalId = null;
-    #windowCloseSignals = new Map(); // windowId -> {window, signalId}
-    #retileIdleId = null;
+    #windowCloseSignals = new Map();
+    #retileLaterId = null;
     #closeIdleId = null;
 
     enable() {
@@ -56,7 +60,6 @@ export default class TilingToggleExtension extends Extension {
         const windows = this.#getWindows();
         if (windows.length === 0) return;
 
-        // Save current geometries
         this.#savedGeometries.clear();
         for (const win of windows) {
             const rect = win.get_frame_rect();
@@ -74,11 +77,9 @@ export default class TilingToggleExtension extends Extension {
 
         this.#tiled = true;
 
-        // Connect window lifecycle signals
+        this.#setupOutline();
         this.#connectWindowCreated();
         this.#connectWindowCloseAll(windows);
-
-        // Apply grid
         this.#retile(windows);
     }
 
@@ -99,32 +100,37 @@ export default class TilingToggleExtension extends Extension {
     }
 
     #cleanup() {
-        this.#cancelAllIdles();
+        this.#cancelPending();
+        this.#destroyOutline();
         this.#disconnectWindowCreated();
         this.#disconnectAllWindowClose();
         this.#savedGeometries.clear();
         this.#tiled = false;
     }
 
-    // --- Retile: the single path that applies grid ---
+    // --- Retile ---
 
     #retile(windows) {
-        // Cancel pending idle callbacks
-        this.#cancelAllIdles();
+        this.#cancelPending();
 
-        // Apply the grid layout
+        // Hide outline during layout transition
+        if (this.#outline)
+            this.#outline.hide();
+
         this.#applyGrid(windows);
 
-        this.#retileIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-            this.#retileIdleId = null;
+        // Use Meta.later_add to position outline AFTER compositor commits frame rects
+        this.#retileLaterId = Meta.later_add(Meta.LaterType.BEFORE_REDRAW, () => {
+            this.#retileLaterId = null;
+            this.#positionOutline();
             return GLib.SOURCE_REMOVE;
         });
     }
 
-    #cancelAllIdles() {
-        if (this.#retileIdleId) {
-            GLib.source_remove(this.#retileIdleId);
-            this.#retileIdleId = null;
+    #cancelPending() {
+        if (this.#retileLaterId !== null) {
+            Meta.later_remove(this.#retileLaterId);
+            this.#retileLaterId = null;
         }
         if (this.#closeIdleId) {
             GLib.source_remove(this.#closeIdleId);
@@ -137,7 +143,6 @@ export default class TilingToggleExtension extends Extension {
         const workspace = global.workspace_manager.get_active_workspace();
         const workArea = workspace.get_work_area_for_monitor(monitor);
 
-        // Inset work area by outer gap
         const areaX = workArea.x + OUTER_GAP;
         const areaY = workArea.y + OUTER_GAP;
         const areaWidth = workArea.width - OUTER_GAP * 2;
@@ -159,7 +164,6 @@ export default class TilingToggleExtension extends Extension {
 
             const y = areaY + row * (cellHeight + gap);
 
-            // Last row might have fewer windows — stretch them
             if (row === rows - 1) {
                 const windowsInLastRow = count - (rows - 1) * cols;
                 const lastGapX = gap * (windowsInLastRow - 1);
@@ -192,7 +196,6 @@ export default class TilingToggleExtension extends Extension {
 
                 if (!this.#tiled) return;
 
-                // Save its geometry so we can restore later
                 const rect = win.get_frame_rect();
                 this.#savedGeometries.set(win.get_id(), {
                     x: rect.x,
@@ -206,8 +209,6 @@ export default class TilingToggleExtension extends Extension {
                     win.unmaximize();
 
                 this.#connectWindowClose(win);
-
-                // Retile everything including the new window
                 this.#retile(this.#getWindows());
             });
         });
@@ -239,9 +240,7 @@ export default class TilingToggleExtension extends Extension {
         for (const [_id, {window, signalId}] of this.#windowCloseSignals) {
             try {
                 window.disconnect(signalId);
-            } catch (_e) {
-                // Window may already be destroyed
-            }
+            } catch (_e) {}
         }
         this.#windowCloseSignals.clear();
     }
@@ -253,13 +252,11 @@ export default class TilingToggleExtension extends Extension {
         this.#savedGeometries.delete(closedId);
         this.#windowCloseSignals.delete(closedId);
 
-        // Cancel any previous close idle (rapid closes)
         if (this.#closeIdleId) {
             GLib.source_remove(this.#closeIdleId);
             this.#closeIdleId = null;
         }
 
-        // Defer retile — window hasn't fully gone yet
         this.#closeIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
             this.#closeIdleId = null;
             if (!this.#tiled) return GLib.SOURCE_REMOVE;
@@ -271,9 +268,63 @@ export default class TilingToggleExtension extends Extension {
                 return GLib.SOURCE_REMOVE;
             }
 
-            // Retile remaining windows
             this.#retile(remaining);
             return GLib.SOURCE_REMOVE;
         });
+    }
+
+    // --- Focus outline ---
+
+    #setupOutline() {
+        this.#destroyOutline();
+
+        if (!this.#settings.get_boolean('enable-outline'))
+            return;
+
+        const color = this.#settings.get_string('outline-color') || '#4a9fff';
+
+        this.#outline = new St.Widget({
+            style: `border: ${OUTLINE_WIDTH}px solid ${color};`,
+            reactive: false,
+            visible: false,
+        });
+        global.window_group.add_child(this.#outline);
+
+        // Synchronous focus handler — no idle, no deferred positioning.
+        // When focus changes, the window rects are already settled.
+        this.#focusSignalId = global.display.connect('notify::focus-window', () => {
+            this.#positionOutline();
+        });
+    }
+
+    #positionOutline() {
+        if (!this.#outline || !this.#tiled) return;
+
+        const focused = global.display.get_focus_window();
+
+        if (!focused || !this.#savedGeometries.has(focused.get_id())) {
+            this.#outline.hide();
+            return;
+        }
+
+        const rect = focused.get_frame_rect();
+        this.#outline.set_position(rect.x - OUTLINE_WIDTH, rect.y - OUTLINE_WIDTH);
+        this.#outline.set_size(rect.width + OUTLINE_WIDTH * 2, rect.height + OUTLINE_WIDTH * 2);
+        this.#outline.show();
+
+        global.window_group.set_child_above_sibling(this.#outline, null);
+    }
+
+    #destroyOutline() {
+        if (this.#focusSignalId) {
+            global.display.disconnect(this.#focusSignalId);
+            this.#focusSignalId = null;
+        }
+
+        if (this.#outline) {
+            global.window_group.remove_child(this.#outline);
+            this.#outline.destroy();
+            this.#outline = null;
+        }
     }
 }

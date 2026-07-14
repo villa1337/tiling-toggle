@@ -7,5 +7,15 @@
       <summary>Toggle tiling</summary>
       <description>Tile all windows on the current workspace, or restore them to their previous positions.</description>
     </key>
+    <key name="enable-outline" type="b">
+      <default>true</default>
+      <summary>Focus outline</summary>
+      <description>Show a colored border around the focused window while tiled.</description>
+    </key>
+    <key name="outline-color" type="s">
+      <default>'#4a9fff'</default>
+      <summary>Outline color</summary>
+      <description>Color of the focus outline border (hex format).</description>
+    </key>
   </schema>
 </schemalist>
