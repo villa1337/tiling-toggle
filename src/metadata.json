@@ -1,0 +1,9 @@
+{
+    "name": "Tiling Toggle",
+    "description": "Toggle-tile all windows on the current workspace with a single keybinding. Press again to restore.",
+    "uuid": "tiling-toggle@villa1337",
+    "shell-version": ["50"],
+    "settings-schema": "org.gnome.shell.extensions.tiling-toggle",
+    "version": 1,
+    "url": "https://github.com/villa1337/tiling-toggle"
+}

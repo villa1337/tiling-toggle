@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.tiling-toggle"
+          path="/org/gnome/shell/extensions/tiling-toggle/">
+    <key name="toggle-tiling" type="as">
+      <default>['&lt;Super&gt;q']</default>
+      <summary>Toggle tiling</summary>
+      <description>Tile all windows on the current workspace, or restore them to their previous positions.</description>
+    </key>
+  </schema>
+</schemalist>
