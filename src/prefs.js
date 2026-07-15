@@ -6,7 +6,7 @@ import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/ex
 
 export default class TilingTogglePreferences extends ExtensionPreferences {
     fillPreferencesWindow(window) {
-        const settings = this.getSettings('org.gnome.shell.extensions.tiling-toggle');
+        const settings = this.getSettings();
 
         const page = new Adw.PreferencesPage({
             title: 'General',

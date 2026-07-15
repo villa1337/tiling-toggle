@@ -4,6 +4,6 @@
     "uuid": "tiling-toggle@villa1337",
     "shell-version": ["50"],
     "settings-schema": "org.gnome.shell.extensions.tiling-toggle",
-    "version": 3,
+    "version": 5,
     "url": "https://github.com/villa1337/tiling-toggle"
 }

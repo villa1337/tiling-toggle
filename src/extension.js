@@ -14,17 +14,14 @@ export default class TilingToggleExtension extends Extension {
     #tiled = false;
     #savedGeometries = new Map();
     #outline = null;
-    #focusSignalId = null;
-    #windowCreatedSignalId = null;
-    #windowCloseSignals = new Map();
-    #windowFullscreenSignals = new Map();
+    #managedWindows = new Set();
     #retileLaterId = null;
     #closeIdleId = null;
     #outlineDelayId = null;
     #retiling = false;
 
     enable() {
-        this.#settings = this.getSettings('org.gnome.shell.extensions.tiling-toggle');
+        this.#settings = this.getSettings();
         Main.wm.addKeybinding(
             'toggle-tiling',
             this.#settings,
@@ -83,8 +80,7 @@ export default class TilingToggleExtension extends Extension {
 
         this.#setupOutline();
         this.#connectWindowCreated();
-        this.#connectWindowCloseAll(windows);
-        this.#connectWindowFullscreenAll(windows);
+        this.#connectWindowSignalsAll(windows);
         this.#retile(windows);
     }
 
@@ -108,8 +104,7 @@ export default class TilingToggleExtension extends Extension {
         this.#cancelPending();
         this.#destroyOutline();
         this.#disconnectWindowCreated();
-        this.#disconnectAllWindowClose();
-        this.#disconnectAllWindowFullscreen();
+        this.#disconnectAllWindowSignals();
         this.#savedGeometries.clear();
         this.#tiled = false;
     }
@@ -255,64 +250,68 @@ export default class TilingToggleExtension extends Extension {
     // --- Auto-tile new windows ---
 
     #connectWindowCreated() {
-        this.#windowCreatedSignalId = global.display.connect('window-created', (_display, win) => {
-            const mapId = win.connect('notify::mapped', () => {
-                win.disconnect(mapId);
+        global.display.connectObject(
+            'window-created', (_display, win) => {
+                win.connectObject(
+                    'notify::mapped', () => {
+                        win.disconnectObject(this);
 
-                if (win.is_skip_taskbar() || win.minimized ||
-                    win.get_window_type() !== Meta.WindowType.NORMAL)
-                    return;
+                        if (win.is_skip_taskbar() || win.minimized ||
+                            win.get_window_type() !== Meta.WindowType.NORMAL)
+                            return;
 
-                if (!this.#tiled) return;
+                        if (!this.#tiled) return;
 
-                const rect = win.get_frame_rect();
-                this.#savedGeometries.set(win.get_id(), {
-                    x: rect.x,
-                    y: rect.y,
-                    width: rect.width,
-                    height: rect.height,
-                    maximized: win.is_maximized(),
-                });
+                        const rect = win.get_frame_rect();
+                        this.#savedGeometries.set(win.get_id(), {
+                            x: rect.x,
+                            y: rect.y,
+                            width: rect.width,
+                            height: rect.height,
+                            maximized: win.is_maximized(),
+                        });
 
-                if (win.is_maximized())
-                    win.unmaximize();
+                        if (win.is_maximized())
+                            win.unmaximize();
 
-                this.#connectWindowClose(win);
-                this.#connectWindowFullscreen(win);
-                this.#retile(this.#getWindows());
-            });
-        });
+                        this.#connectWindowSignals(win);
+                        this.#retile(this.#getWindows());
+                    },
+                    this
+                );
+            },
+            this
+        );
     }
 
     #disconnectWindowCreated() {
-        if (this.#windowCreatedSignalId) {
-            global.display.disconnect(this.#windowCreatedSignalId);
-            this.#windowCreatedSignalId = null;
-        }
+        global.display.disconnectObject(this);
     }
 
-    // --- Window close handling ---
+    // --- Per-window signals (close + fullscreen) ---
 
-    #connectWindowClose(win) {
-        const signalId = win.connect('unmanaging', () => {
-            this.#onWindowClosed(win);
-        });
-        this.#windowCloseSignals.set(win.get_id(), {window: win, signalId});
+    #connectWindowSignals(win) {
+        if (this.#managedWindows.has(win)) return;
+        this.#managedWindows.add(win);
+
+        win.connectObject(
+            'unmanaging', () => this.#onWindowClosed(win),
+            'notify::fullscreen', () => this.#onWindowFullscreenChanged(win),
+            this
+        );
     }
 
-    #connectWindowCloseAll(windows) {
+    #connectWindowSignalsAll(windows) {
         for (const win of windows) {
-            this.#connectWindowClose(win);
+            this.#connectWindowSignals(win);
         }
     }
 
-    #disconnectAllWindowClose() {
-        for (const [_id, {window, signalId}] of this.#windowCloseSignals) {
-            try {
-                window.disconnect(signalId);
-            } catch (_e) {}
+    #disconnectAllWindowSignals() {
+        for (const win of this.#managedWindows) {
+            win.disconnectObject(this);
         }
-        this.#windowCloseSignals.clear();
+        this.#managedWindows.clear();
     }
 
     #onWindowClosed(closedWin) {
@@ -320,8 +319,7 @@ export default class TilingToggleExtension extends Extension {
 
         const closedId = closedWin.get_id();
         this.#savedGeometries.delete(closedId);
-        this.#windowCloseSignals.delete(closedId);
-        this.#disconnectWindowFullscreen(closedId);
+        this.#managedWindows.delete(closedWin);
 
         if (this.#closeIdleId) {
             GLib.source_remove(this.#closeIdleId);
@@ -345,38 +343,6 @@ export default class TilingToggleExtension extends Extension {
     }
 
     // --- Fullscreen handling ---
-
-    #connectWindowFullscreen(win) {
-        const signalId = win.connect('notify::fullscreen', () => {
-            this.#onWindowFullscreenChanged(win);
-        });
-        this.#windowFullscreenSignals.set(win.get_id(), {window: win, signalId});
-    }
-
-    #connectWindowFullscreenAll(windows) {
-        for (const win of windows) {
-            this.#connectWindowFullscreen(win);
-        }
-    }
-
-    #disconnectWindowFullscreen(winId) {
-        const entry = this.#windowFullscreenSignals.get(winId);
-        if (entry) {
-            try {
-                entry.window.disconnect(entry.signalId);
-            } catch (_e) {}
-            this.#windowFullscreenSignals.delete(winId);
-        }
-    }
-
-    #disconnectAllWindowFullscreen() {
-        for (const [_id, {window, signalId}] of this.#windowFullscreenSignals) {
-            try {
-                window.disconnect(signalId);
-            } catch (_e) {}
-        }
-        this.#windowFullscreenSignals.clear();
-    }
 
     #onWindowFullscreenChanged(win) {
         if (!this.#tiled) return;
@@ -416,10 +382,13 @@ export default class TilingToggleExtension extends Extension {
         // Synchronous focus handler — no idle, no deferred positioning.
         // When focus changes, the window rects are already settled.
         // Skip during active retile — the retile callback will position the outline.
-        this.#focusSignalId = global.display.connect('notify::focus-window', () => {
-            if (!this.#retiling)
-                this.#positionOutline();
-        });
+        global.display.connectObject(
+            'notify::focus-window', () => {
+                if (!this.#retiling)
+                    this.#positionOutline();
+            },
+            this
+        );
     }
 
     #positionOutline() {
@@ -441,11 +410,6 @@ export default class TilingToggleExtension extends Extension {
     }
 
     #destroyOutline() {
-        if (this.#focusSignalId) {
-            global.display.disconnect(this.#focusSignalId);
-            this.#focusSignalId = null;
-        }
-
         if (this.#outline) {
             global.window_group.remove_child(this.#outline);
             this.#outline.destroy();
